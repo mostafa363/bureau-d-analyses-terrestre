@@ -5,15 +5,20 @@ Script unique, se relance du telechargement au dernier chiffre.
 
 import csv
 import os
+import re
+import sys
 import urllib.request
 import warnings
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, TargetEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -86,23 +91,19 @@ def phase1_ouvrir_la_caisse():
 def phase2_typage(df):
     section("PHASE 2 - rien n'est du bon type")
 
-    # coordonnees et duree -> nombres
     df["latitude_num"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude_num"] = pd.to_numeric(df["longitude"], errors="coerce")
     df["duration_seconds_num"] = pd.to_numeric(df["duration_seconds"], errors="coerce")
 
-    # les deux dates -> dates
     df["datetime_parsed"] = pd.to_datetime(df["datetime"], format="%m/%d/%Y %H:%M", errors="coerce")
     df["date_posted_parsed"] = pd.to_datetime(df["date_posted"], format="%m/%d/%Y", errors="coerce")
 
     anomalies = []
 
-    # latitude : valeurs non vides qui refusent la conversion
     mask = df["latitude_num"].isna() & df["latitude"].ne("")
     valeurs = df.loc[mask, "latitude"].tolist()
     anomalies.append(("latitude", len(valeurs), valeurs[:5], "service de transmission (geocodage corrompu)"))
 
-    # duration_seconds : deux sous-anomalies de nature differente
     mask_txt = df["duration_seconds_num"].isna() & df["duration_seconds"].ne("")
     valeurs_txt = df.loc[mask_txt, "duration_seconds"].tolist()
     anomalies.append(("duration_seconds (caractere parasite)", len(valeurs_txt), valeurs_txt,
@@ -112,13 +113,11 @@ def phase2_typage(df):
     anomalies.append(("duration_seconds (valeur manquante)", int(mask_vide.sum()), ["''"] * min(3, int(mask_vide.sum())),
                        "temoin (n'a jamais donne de duree exploitable)"))
 
-    # datetime : toutes les valeurs invalides sont des "24:00"
     mask_dt = df["datetime_parsed"].isna() & df["datetime"].ne("")
     valeurs_dt = df.loc[mask_dt, "datetime"].tolist()
     anomalies.append(("datetime (heure '24:00')", len(valeurs_dt), valeurs_dt[:5],
                        "temoin (a ecrit minuit sous la forme 24:00, heure qui n'existe pas)"))
 
-    # date_posted et longitude : verifiees, propres (mentionnees pour contraste)
     mask_dp = df["date_posted_parsed"].isna() & df["date_posted"].ne("")
     n_dp = int(mask_dp.sum())
     mask_lon = df["longitude_num"].isna() & df["longitude"].ne("")
@@ -151,7 +150,6 @@ def phase3_canulars(df):
     print(f"regle : {regle}")
     print(f"releves marques canulars : {n_canulars} sur {len(df)} ({proportion:.2%})")
 
-    # limite connue : la regle rate les signalements expliques sans le mot "hoax"
     explication_banale = df["comments"].str.contains(
         r"balloon|venus|meteor|satellite|swamp gas", case=False, na=False, regex=True
     )
@@ -163,7 +161,7 @@ def phase3_canulars(df):
 
 
 # ---------------------------------------------------------------------------
-# Construction des features (partagee entre phase 4 et phase 5)
+# Construction des features (partagee entre phases 4 a 10)
 # ---------------------------------------------------------------------------
 def construire_features(df):
     features = pd.DataFrame(index=df.index)
@@ -181,10 +179,12 @@ CAT_COLS = ["state", "country", "shape"]
 NUM_COLS = ["duration_seconds_num", "hour", "month", "days_to_post"]
 
 
-def entrainer_et_evaluer(X, y, avec_texte):
-    Xtr, Xte, ytr, yte = train_test_split(
-        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
-    )
+def entrainer_sur_indices(X, y, idx_tr, idx_te, avec_texte):
+    """Coeur d'entrainement : ne connait que les indices qu'on lui donne.
+    Le pipeline (imputation, encodage, vocabulaire) n'est jamais fit()
+    que sur idx_tr - c'est ce que la phase 10 vient verifier."""
+    Xtr, Xte = X.loc[idx_tr], X.loc[idx_te]
+    ytr, yte = y.loc[idx_tr], y.loc[idx_te]
 
     transformers = [
         ("cat", OneHotEncoder(handle_unknown="ignore"), CAT_COLS),
@@ -212,6 +212,13 @@ def entrainer_et_evaluer(X, y, avec_texte):
         "yte": yte,
         "pred": pred,
     }
+
+
+def entrainer_et_evaluer(X, y, avec_texte):
+    idx_tr, idx_te = train_test_split(
+        X.index, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    )
+    return entrainer_sur_indices(X, y, idx_tr, idx_te, avec_texte)
 
 
 # ---------------------------------------------------------------------------
@@ -294,14 +301,381 @@ def phase6_stagiaire(label, resultat_avant, resultat_apres):
     return acc_stagiaire
 
 
+# ===========================================================================
+# PARTIE 2 - le Conseil renvoie le rapport
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Phase 7 : plusieurs temoins, un seul evenement
+# ---------------------------------------------------------------------------
+def phase7_evenements(df, label, resultat_p5):
+    section("PHASE 7 - plusieurs temoins, un seul evenement")
+
+    # date seule, tiree directement du texte brut (recupere aussi les 1220
+    # lignes dont l'heure invalide '24:00' avait fait echouer tout le parsing en phase 2)
+    df["obs_date"] = pd.to_datetime(
+        df["datetime"].str.split(" ").str[0], format="%m/%d/%Y", errors="coerce"
+    ).astype(str)
+    df["event_key"] = (
+        df["obs_date"] + "|" +
+        df["city"].str.lower().str.strip() + "|" +
+        df["state"].str.lower().str.strip()
+    )
+
+    tailles = df.groupby("event_key").size()
+    multi = tailles[tailles > 1]
+    plus_gros_evenement = tailles.idxmax()
+
+    print(f"evenements signales par plus d'un temoin : {len(multi)}")
+    print(f"temoins pour le plus gros d'entre eux     : {tailles.max()}  ({plus_gros_evenement})")
+
+    print(f"\nexemple - tous les temoins de '{plus_gros_evenement}' :")
+    exemple = df.loc[df["event_key"] == plus_gros_evenement, ["datetime", "city", "state"]]
+    print(exemple.head(10).to_string())
+    print(f"... {len(exemple)} temoins au total pour cette seule nuit.")
+
+    # temoignages copies mot pour mot
+    non_vides = df["comments"].fillna("")
+    non_vides = non_vides[non_vides.str.strip() != ""]
+    doublons = non_vides.value_counts()
+    doublons = doublons[doublons > 1]
+    print(f"\ntemoignages recopies mot pour mot : {len(doublons)} textes distincts, "
+          f"{int(doublons.sum())} lignes concernees")
+
+    # combien de relevés etaient a cheval sur les deux cotes, dans la decoupe d'hier (phase 4/5)
+    idx_tr_hier, idx_te_hier = train_test_split(
+        df.index, test_size=0.2, random_state=RANDOM_STATE, stratify=label
+    )
+    tr_set, te_set = set(idx_tr_hier), set(idx_te_hier)
+    cheval_evenements, cheval_lignes = 0, 0
+    for k in multi.index:
+        membres = df.index[df["event_key"] == k]
+        dans_tr = any(m in tr_set for m in membres)
+        dans_te = any(m in te_set for m in membres)
+        if dans_tr and dans_te:
+            cheval_evenements += 1
+            cheval_lignes += len(membres)
+    print(f"\nrelevés a cheval sur train/test, decoupe d'hier (aleatoire simple) : {cheval_lignes} "
+          f"lignes (dans {cheval_evenements} evenements)")
+
+    # nouvelle decoupe : un evenement entier part du meme cote
+    X = construire_features(df)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)
+    idx_tr, idx_te = next(gss.split(X, label, groups=df["event_key"]))
+    idx_tr, idx_te = X.index[idx_tr], X.index[idx_te]
+    resultat_groupe = entrainer_sur_indices(X, label, idx_tr, idx_te, avec_texte=False)
+
+    print(f"\nrecall    : avant (phase 5) {resultat_p5['recall']:.2%}  ->  "
+          f"apres decoupe par evenement {resultat_groupe['recall']:.2%}")
+    print(f"precision : avant (phase 5) {resultat_p5['precision']:.2%}  ->  "
+          f"apres decoupe par evenement {resultat_groupe['precision']:.2%}")
+
+    return resultat_groupe
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 : l'ordre des choses (decoupe chronologique)
+# ---------------------------------------------------------------------------
+def phase8_ordre_du_temps(df, label, resultat_p7):
+    section("PHASE 8 - l'ordre des choses")
+
+    print("Deux dates disponibles : datetime (quand le temoin a leve les yeux) et")
+    print("date_posted (quand le Bureau a recu/publie le dossier). On coupe sur")
+    print("date_posted : c'est elle qui dit ce que le systeme a reellement sous la")
+    print("main au moment de juger. Un evenement ancien publie tard n'est pas 'connu'")
+    print("plus tot pour autant - le systeme ne le voit que quand le Bureau le publie.")
+
+    dates_valides = df["date_posted_parsed"].dropna().sort_values()
+    coupure = dates_valides.quantile(0.8)
+    print(f"\ndate de coupure : {coupure.date()}  (80e percentile de date_posted)")
+
+    avant_coupure = df["date_posted_parsed"] <= coupure
+    tr_set = set(df.index[avant_coupure])
+    te_set = set(df.index[~avant_coupure & df["date_posted_parsed"].notna()])
+
+    # aucun evenement (phase 7) ne doit chevaucher la coupure
+    chevauchent, lignes_rattachees = 0, 0
+    for k, membres_idx in df.groupby("event_key").groups.items():
+        membres = list(membres_idx)
+        if len(membres) < 2:
+            continue
+        dans_tr = [m in tr_set for m in membres]
+        if any(dans_tr) and not all(dans_tr):
+            chevauchent += 1
+            for m in membres:
+                if m in te_set:
+                    te_set.discard(m)
+                    tr_set.add(m)
+                    lignes_rattachees += 1
+    print(f"evenements a cheval sur la coupure : {chevauchent} ({lignes_rattachees} lignes rattachees au train)")
+
+    idx_tr = pd.Index(sorted(tr_set))
+    idx_te = pd.Index(sorted(te_set))
+    print(f"\nrelevés cote apprentissage : {len(idx_tr)}")
+    print(f"relevés cote test          : {len(idx_te)}")
+    print(f"proportion canulars - apprentissage : {label.loc[idx_tr].mean():.2%}")
+    print(f"proportion canulars - test          : {label.loc[idx_te].mean():.2%}")
+
+    X = construire_features(df)
+    resultat = entrainer_sur_indices(X, label, idx_tr, idx_te, avec_texte=False)
+    print(f"\nrecall    : avant (phase 7, regroupe) {resultat_p7['recall']:.2%}  ->  "
+          f"apres decoupe chronologique {resultat['recall']:.2%}")
+    print(f"precision : avant (phase 7, regroupe) {resultat_p7['precision']:.2%}  ->  "
+          f"apres decoupe chronologique {resultat['precision']:.2%}")
+
+    return idx_tr, idx_te, resultat
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 : les cases vides
+# ---------------------------------------------------------------------------
+def phase9_cases_vides(df, label):
+    section("PHASE 9 - les cases vides")
+
+    colonnes_trouees = ["country", "state", "duration_hours_min"]
+    print("trois colonnes les plus trouees - taux de canulars, troue vs rempli :\n")
+    for c in colonnes_trouees:
+        troue = df[c].fillna("").str.strip() == ""
+        taux_troue = label[troue].mean()
+        taux_rempli = label[~troue].mean()
+        print(f"{c:20s} troue={int(troue.sum()):6d}   "
+              f"taux(troue)={taux_troue:.4%}   taux(rempli)={taux_rempli:.4%}")
+
+    print("\nTraitement retenu :")
+    print("- country / state : le trou reste sa propre categorie ('manquant') dans")
+    print("  l'encodage - le modele voit directement qu'il y avait un trou, rien n'est")
+    print("  efface (voir phase 12 : shape/state/country utilisent 'manquant', pas")
+    print("  'unknown', pour ne pas le confondre avec la vraie reponse du temoin).")
+    print("- duration_hours_min (recyclee en duree numerique, phase 11) : un indicateur")
+    print("  binaire 'duree_manquante' accompagne la valeur imputee - boucher le trou")
+    print("  sans effacer sa trace.")
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 : la chaine de traitement du Bureau (fuite de pretraitement)
+# ---------------------------------------------------------------------------
+def phase10_chaine_de_traitement(df, label, idx_tr, idx_te, resultat_p8):
+    section("PHASE 10 - la chaine de traitement du Bureau")
+
+    print("Verification demandee : moyennes, medianes, vocabulaires - calcules sur quoi ?")
+    print("Dans ce script, l'imputation (SimpleImputer) et l'encodage (OneHotEncoder)")
+    print("sont places DANS un sklearn Pipeline, et ce pipeline n'est appele en .fit()")
+    print("que sur les indices d'apprentissage (idx_tr) - jamais sur le jeu complet,")
+    print("et ce depuis la phase 4. Rien a corriger ici pour ce point precis.")
+
+    X = construire_features(df)
+    resultat = entrainer_sur_indices(X, label, idx_tr, idx_te, avec_texte=False)
+    print(f"\nrecall    : {resultat['recall']:.2%}  (identique a la phase 8 - la methode etait deja saine)")
+    print(f"precision : {resultat['precision']:.2%}")
+    print("Ce n'aurait pas ete vrai avec une mediane calculee a la main via df.median()")
+    print("sur le DataFrame entier avant le train_test_split : c'est cette erreur-la")
+    print("que le Pipeline sklearn empeche structurellement.")
+
+    n_canulars_test = int(label.loc[idx_te].sum())
+    print(f"\nCote test : {n_canulars_test} canulars sur {len(idx_te)} relevés - largement")
+    print("assez pour que recall/precision ne soient pas de la decoration statistique.")
+
+    nouveau_releve = pd.DataFrame([{
+        "state": "il", "country": "us", "shape": "triangle",
+        "duration_seconds_num": 300.0, "hour": 21, "month": 10, "days_to_post": 15,
+        "comments": "",
+    }])
+    prediction = resultat["modele"].predict(nouveau_releve)[0]
+    proba = resultat["modele"].predict_proba(nouveau_releve)[0][1]
+    print(f"\nDemo - un releve invente a la main traverse toute la chaine en un seul appel :")
+    print(f"  {nouveau_releve.iloc[0].to_dict()}")
+    print(f"  -> modele.predict() -> canular ? {bool(prediction)}  (probabilite = {proba:.2%})")
+
+    return resultat
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 : combien de temps ca a dure
+# ---------------------------------------------------------------------------
+DUREE_UNITES = {
+    "sec": 1, "secs": 1, "second": 1, "seconds": 1, "s": 1,
+    "min": 60, "mins": 60, "minute": 60, "minutes": 60, "m": 60,
+    "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600, "h": 3600,
+    "day": 86400, "days": 86400,
+}
+_UNITE_RE = "|".join(sorted(DUREE_UNITES, key=len, reverse=True))
+_DUREE_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(?:-|to)?\s*(\d+(?:\.\d+)?)?\s*(" + _UNITE_RE + r")\b")
+
+
+def parser_duree_texte(s):
+    """Extrait une duree en secondes depuis le texte libre du temoin (ex: '5 minutes', '1-2 hrs')."""
+    if not isinstance(s, str):
+        return np.nan
+    s = s.lower().strip()
+    if not s:
+        return np.nan
+    m = _DUREE_PATTERN.search(s)
+    if not m:
+        return np.nan
+    a = float(m.group(1))
+    b = float(m.group(2)) if m.group(2) else None
+    unite = DUREE_UNITES[m.group(3)]
+    return (a + b) / 2 * unite if b is not None else a * unite
+
+
+def phase11_duree(df):
+    section("PHASE 11 - combien de temps ca a dure")
+
+    df["duree_texte_s"] = df["duration_hours_min"].apply(parser_duree_texte)
+    structuree_ok = df["duration_seconds_num"].notna() & (df["duration_seconds_num"] > 0)
+    texte_ok = df["duree_texte_s"].notna() & (df["duree_texte_s"] > 0)
+
+    duree_brute = df["duration_seconds_num"].where(structuree_ok, df["duree_texte_s"])
+    duree_brute = duree_brute.where(duree_brute > 0)
+
+    n_inutilisable = int(duree_brute.isna().sum())
+    print(f"relevés dont la duree reste inutilisable apres traitement : {n_inutilisable} / {len(df)}")
+
+    contradiction = (~structuree_ok) & texte_ok
+    print(f"relevés ou la colonne secondes dit 0/rien alors que le texte est lisible : "
+          f"{int(contradiction.sum())}")
+
+    deux_valides = structuree_ok & texte_ok
+    ratio = df.loc[deux_valides, "duration_seconds_num"] / df.loc[deux_valides, "duree_texte_s"]
+    gros_ecart = int(((ratio > 3) | (ratio < 1 / 3)).sum())
+    print(f"relevés ou les deux colonnes sont valides mais tres eloignees (ratio > 3x) : "
+          f"{gros_ecart} / {int(deux_valides.sum())}")
+
+    print(f"\nduree mediane apres traitement : {duree_brute.median():.0f} s")
+
+    plus_dune_journee = int((duree_brute > 86400).sum())
+    print(f"relevés annoncant plus d'une journee d'observation : {plus_dune_journee}")
+
+    top3 = duree_brute.sort_values(ascending=False).head(3)
+    print("\n3 durees les plus longues du fichier :")
+    for idx, val in top3.items():
+        print(f"  {df.loc[idx, 'datetime']} - {df.loc[idx, 'city']!r} - "
+              f"temoin a ecrit {df.loc[idx, 'duration_hours_min']!r} -> {val:.0f} s")
+
+    CAP = 86400
+    print(f"\nDecision : les durees au-dela de {CAP} s (1 jour) sont plafonnees a {CAP} s,")
+    print(f"pas supprimees - ce sont des phenomenes 'continus/recurrents' revendiques par")
+    print(f"le temoin, pas des erreurs de saisie ; {plus_dune_journee} lignes plafonnees,")
+    print("aucune ligne retiree, la mediane (robuste) n'a pas bouge a cause d'elles.")
+
+    df["duree_finale_s"] = duree_brute.clip(upper=CAP)
+    df["duree_manquante"] = duree_brute.isna().astype(int)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Phase 12 : la ville et l'heure
+# ---------------------------------------------------------------------------
+def phase12_ville_et_heure(df, label, idx_tr, idx_te):
+    section("PHASE 12 - la ville et l'heure")
+
+    # ---- heure : encodage cyclique ----
+    heures = df["datetime_parsed"].dt.hour
+    df["hour_sin"] = np.sin(2 * np.pi * heures / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * heures / 24)
+
+    def dist_heure(h1, h2):
+        s1, c1 = np.sin(2 * np.pi * h1 / 24), np.cos(2 * np.pi * h1 / 24)
+        s2, c2 = np.sin(2 * np.pi * h2 / 24), np.cos(2 * np.pi * h2 / 24)
+        return float(np.hypot(s1 - s2, c1 - c2))
+
+    print(f"distance encodee entre 23h et 0h  : {dist_heure(23, 0):.3f}")
+    print(f"distance encodee entre 23h et 20h : {dist_heure(23, 20):.3f}")
+    print("-> 23h ressort bien plus proche de 0h que de 20h : l'encodage cyclique")
+    print("   corrige l'absurdite d'une echelle 0-23 lineaire.")
+
+    # ---- shape : nettoyage ----
+    shape_brute = df["shape"].replace("", "manquant").fillna("manquant")
+    n_formes_avant = df["shape"].replace("", np.nan).nunique()
+    corrections = {"changed": "changing", "round": "circle"}
+    shape_propre = shape_brute.replace(corrections)
+    n_formes_apres = shape_propre[shape_propre != "manquant"].nunique()
+    df["shape_propre"] = shape_propre
+
+    print(f"\nformes avant nettoyage : {n_formes_avant}")
+    print("corrections appliquees : changed -> changing, round -> circle")
+    print(f"(meme forme decrite sous deux orthographes differentes)")
+    print(f"formes retenues apres nettoyage (hors valeurs manquantes) : {n_formes_apres}")
+
+    # ---- ville : largeur du tableau ----
+    n_villes = df["city"].nunique()
+    n_villes_uniques = int((df["city"].value_counts() == 1).sum())
+    print(f"\nvilles distinctes dans la transmission : {n_villes}")
+    print(f"villes qui n'apparaissent qu'une seule fois : {n_villes_uniques}")
+    print("regle appliquee : chaque ville est remplacee par son taux de canulars,")
+    print("calcule uniquement sur la partie apprentissage (TargetEncoder) - une seule")
+    print("colonne au lieu d'une par ville.")
+
+    state_propre = df["state"].replace("", "manquant").fillna("manquant")
+    country_propre = df["country"].replace("", "manquant").fillna("manquant")
+
+    features_finales = pd.DataFrame({
+        "state": state_propre,
+        "country": country_propre,
+        "shape": shape_propre,
+        "city": df["city"],
+        "duree": df["duree_finale_s"],
+        "duree_manquante": df["duree_manquante"],
+        "hour_sin": df["hour_sin"],
+        "hour_cos": df["hour_cos"],
+        "month": df["datetime_parsed"].dt.month,
+        "days_to_post": (df["date_posted_parsed"] - df["datetime_parsed"]).dt.days,
+    }, index=df.index)
+
+    pre_final = ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore"), ["state", "country", "shape"]),
+        ("ville", TargetEncoder(target_type="binary", random_state=RANDOM_STATE), ["city"]),
+        ("num", SimpleImputer(strategy="median"),
+         ["duree", "duree_manquante", "hour_sin", "hour_cos", "month", "days_to_post"]),
+    ])
+
+    ytr = label.loc[idx_tr].astype(int)
+    Xtr_transforme = pre_final.fit_transform(features_finales.loc[idx_tr], ytr)
+    largeur_apres = Xtr_transforme.shape[1]
+    largeur_avant_hypothese = largeur_apres - 1 + n_villes  # remplace la colonne ville (1) par un one-hot naif
+
+    print(f"\nTargetEncoder.fit() appele sur {len(idx_tr)} lignes (apprentissage) uniquement.")
+    villes_test_jamais_vues = int((~df.loc[idx_te, "city"].isin(df.loc[idx_tr, "city"])).sum())
+    print(f"villes du cote test absentes de l'apprentissage : {villes_test_jamais_vues} "
+          "-> recoivent le taux moyen global, pas de fuite possible.")
+
+    print(f"\nlargeur du tableau si la ville etait en one-hot naif : {largeur_avant_hypothese} colonnes")
+    print(f"largeur du tableau reelle (ville target-encodee)     : {largeur_apres} colonnes")
+
+    # bilan cumule : toutes les corrections des phases 7 a 12 ensemble
+    modele_final = Pipeline([
+        ("pre", pre_final),
+        ("clf", LogisticRegression(max_iter=3000, class_weight="balanced")),
+    ])
+    modele_final.fit(features_finales.loc[idx_tr], ytr)
+    pred_final = modele_final.predict(features_finales.loc[idx_te])
+    yte = label.loc[idx_te].astype(int)
+    recall_final = recall_score(yte, pred_final)
+    precision_final = precision_score(yte, pred_final)
+
+    print("\nBilan cumule (regroupement + decoupe chronologique + ville/heure/forme) :")
+    print(f"recall final    : {recall_final:.2%}")
+    print(f"precision finale: {precision_final:.2%}")
+
+    return {"recall": recall_final, "precision": precision_final}
+
+
 def main():
     telecharger_si_besoin()
     df, total, n_chargees, n_de_cote = phase1_ouvrir_la_caisse()
     df = phase2_typage(df)
     label = phase3_canulars(df)
-    X, resultat_avant = phase4_premier_verdict(df, label)
-    resultat_apres = phase5_fuite(df, label, resultat_avant)
-    phase6_stagiaire(label, resultat_avant, resultat_apres)
+    X, resultat_p4 = phase4_premier_verdict(df, label)
+    resultat_p5 = phase5_fuite(df, label, resultat_p4)
+    phase6_stagiaire(label, resultat_p4, resultat_p5)
+
+    resultat_p7 = phase7_evenements(df, label, resultat_p5)
+    idx_tr, idx_te, resultat_p8 = phase8_ordre_du_temps(df, label, resultat_p7)
+    phase9_cases_vides(df, label)
+    phase10_chaine_de_traitement(df, label, idx_tr, idx_te, resultat_p8)
+    df = phase11_duree(df)
+    phase12_ville_et_heure(df, label, idx_tr, idx_te)
 
     section("FIN")
     print("Toutes les phases ont tourne. Voir RAPPORT.md pour la synthese ecrite.")
