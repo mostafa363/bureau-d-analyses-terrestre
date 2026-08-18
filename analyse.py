@@ -661,6 +661,333 @@ def phase12_ville_et_heure(df, label, idx_tr, idx_te):
     return {"recall": recall_final, "precision": precision_final}
 
 
+# ===========================================================================
+# PARTIE 3 - defendre une decision
+# ===========================================================================
+
+COUT_CANULAR_MANQUE = 30   # faux negatif : une equipe part travailler sur du vent
+COUT_FAUSSE_ALERTE = 2     # faux positif : une observation potentiellement utile est perdue
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 : la facture du Bureau
+# ---------------------------------------------------------------------------
+def phase13_facture(df, label, idx_te, resultat):
+    section("PHASE 13 - la facture du Bureau")
+
+    modele = resultat["modele"]
+    X = construire_features(df)
+    Xte = X.loc[idx_te]
+    yte = label.loc[idx_te].values
+    proba = modele.predict_proba(Xte)[:, 1]
+
+    print(f"grille : canular manque = {COUT_CANULAR_MANQUE} credits, "
+          f"fausse alerte = {COUT_FAUSSE_ALERTE} credits, sinon 0")
+
+    seuils = np.arange(0.0, 1.001, 0.01)
+    couts = np.empty(len(seuils))
+    for i, s in enumerate(seuils):
+        pred = proba >= s
+        fn = int((~pred & yte).sum())
+        fp = int((pred & ~yte).sum())
+        couts[i] = fn * COUT_CANULAR_MANQUE + fp * COUT_FAUSSE_ALERTE
+
+    print(f"\n{'seuil':>6s} {'cout (credits)':>15s}")
+    for s in [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0]:
+        i = np.argmin(np.abs(seuils - s))
+        print(f"{seuils[i]:6.2f} {couts[i]:15.0f}")
+
+    i_opt = int(couts.argmin())
+    seuil_opt = float(seuils[i_opt])
+    cout_opt = float(couts[i_opt])
+    i_05 = int(np.argmin(np.abs(seuils - 0.5)))
+    cout_05 = float(couts[i_05])
+
+    print(f"\nseuil retenu (cout minimal) : {seuil_opt:.2f}  ->  {cout_opt:.0f} credits")
+    print(f"seuil par defaut (0.5)                        ->  {cout_05:.0f} credits")
+    print(f"ecart                                          :  {cout_05 - cout_opt:.0f} credits economises")
+
+    pred_opt = proba >= seuil_opt
+    recall_opt = recall_score(yte, pred_opt)
+    n_alertes = int(pred_opt.sum())
+    print(f"\na ce seuil : recall {recall_opt:.2%}, {n_alertes} alertes levees sur {len(yte)} relevés.")
+    if recall_opt < 0.1:
+        n_canulars = int(yte.sum())
+        print(f"ATTENTION : {n_canulars} canulars sont presents dans le test ; a ce seuil le")
+        print("systeme n'en attrape presque aucun. Le cout minimal ressemble ici au")
+        print("stagiaire de la phase 6 - parce que la precision du modele est si faible")
+        print("(phase 5) que chaque relance de recall coute trop de fausses alertes. Ce")
+        print("seuil resout l'equation posee, mais pas forcement le vrai probleme du")
+        print("Bureau - voir phase 14 : les probabilites elles-memes sont a reprendre.")
+
+    return {"seuil": seuil_opt, "cout_seuil": cout_opt, "cout_05": cout_05}
+
+
+# ---------------------------------------------------------------------------
+# Phase 14 : une promesse a 80%
+# ---------------------------------------------------------------------------
+def table_calibration(proba, y, n_tranches=10):
+    """Tranches a effectif egal (quantiles) : garantit un n visible par tranche
+    quelle que soit la forme de la distribution de probabilites."""
+    tranches = pd.qcut(proba, q=n_tranches, duplicates="drop")
+    df_tmp = pd.DataFrame({"tranche": tranches, "proba": proba, "y": y})
+    resume = df_tmp.groupby("tranche", observed=True).agg(
+        n=("y", "size"), annonce=("proba", "mean"), observe=("y", "mean")
+    )
+    return resume
+
+
+def phase14_promesse_80(df, label, idx_tr, idx_te, resultat):
+    section("PHASE 14 - une promesse a 80%")
+
+    modele = resultat["modele"]
+    X = construire_features(df)
+    Xte = X.loc[idx_te]
+    yte = label.loc[idx_te].values
+    proba = modele.predict_proba(Xte)[:, 1]
+
+    print("avant correction :")
+    resume = table_calibration(proba, yte)
+    print(resume.to_string(float_format=lambda v: f"{v:.3f}"))
+
+    ecart_moyen = (resume["annonce"] - resume["observe"]).mean()
+    print(f"\necart moyen annonce-observe : {ecart_moyen:+.3f}")
+    print("sens de l'erreur : le systeme est TROP CONFIANT sur toute la plage - il")
+    print("annonce des probabilites bien plus hautes que ce qui se produit vraiment.")
+    print("Consequence du class_weight='balanced' : il corrige le classement mais")
+    print("deforme le chiffre.")
+
+    from sklearn.calibration import CalibratedClassifierCV
+    Xtr = X.loc[idx_tr]
+    ytr = label.loc[idx_tr]
+    modele_calibre = CalibratedClassifierCV(modele, method="sigmoid", cv=5)
+    modele_calibre.fit(Xtr, ytr)
+    proba_corrigee = modele_calibre.predict_proba(Xte)[:, 1]
+
+    print("\napres recalibrage (sigmoid / Platt, appris sur le train uniquement) :")
+    resume_corrige = table_calibration(proba_corrigee, yte)
+    print(resume_corrige.to_string(float_format=lambda v: f"{v:.3f}"))
+    ecart_corrige = (resume_corrige["annonce"] - resume_corrige["observe"]).mean()
+    print(f"\necart moyen apres correction : {ecart_corrige:+.3f}")
+
+    return modele_calibre
+
+
+# ---------------------------------------------------------------------------
+# Phase 15 : deux analystes, deux chiffres
+# ---------------------------------------------------------------------------
+def phase15_deux_analystes(df, label, idx_te, resultat):
+    section("PHASE 15 - deux analystes, deux chiffres")
+
+    modele = resultat["modele"]
+    X = construire_features(df)
+    Xte = X.loc[idx_te]
+    yte = label.loc[idx_te].values
+    pred = modele.predict_proba(Xte)[:, 1] >= 0.5
+
+    n_test = len(yte)
+    n_canulars_test = int(yte.sum())
+    print(f"taille de la partie test        : {n_test}")
+    print(f"canulars reellement presents    : {n_canulars_test}")
+
+    n_reech = 1000
+    rng = np.random.RandomState(RANDOM_STATE)
+    recalls = []
+    for _ in range(n_reech):
+        idx = rng.randint(0, n_test, n_test)
+        yb, pb = yte[idx], pred[idx]
+        tp = int((yb & pb).sum())
+        fn = int((yb & ~pb).sum())
+        if tp + fn > 0:
+            recalls.append(tp / (tp + fn))
+    recalls = np.array(recalls)
+    lo, hi = np.percentile(recalls, [2.5, 97.5])
+    point = int((yte & pred).sum()) / n_canulars_test
+
+    print(f"\nnombre de reechantillonnages (bootstrap) : {n_reech}")
+    print(f"recall (nombre principal) : {point:.2%}   intervalle 95% : [{lo:.2%} ; {hi:.2%}]")
+
+    print(f"\nReponse au Conseil : avec seulement {n_canulars_test} canulars dans la partie")
+    print(f"test, le recall bouge de {(hi - lo):.1%} rien qu'en rejouant le tirage au sort du")
+    print("split. 0,31 et 0,34 (l'ecart des deux analystes fictifs) tiennent largement")
+    print("dans cette marge - il n'y a pas de gagnant a designer sur un seul chiffre.")
+
+    return {"lo": lo, "hi": hi, "point": point, "n_test": n_test, "n_canulars_test": n_canulars_test}
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 : trois dossiers sur le bureau
+# ---------------------------------------------------------------------------
+def expliquer_ligne(modele, ligne_df):
+    """Contribution de chaque feature transformee (coefficient x valeur) pour UNE ligne."""
+    pre = modele.named_steps["pre"]
+    clf = modele.named_steps["clf"]
+    transformee = pre.transform(ligne_df)
+    if hasattr(transformee, "toarray"):
+        transformee = transformee.toarray()
+    noms = pre.get_feature_names_out()
+    contributions = transformee[0] * clf.coef_[0]
+    ordre = np.argsort(-np.abs(contributions))
+    return [(noms[i], float(contributions[i])) for i in ordre[:5]]
+
+
+def phase16_trois_dossiers(df, label, idx_te, resultat):
+    section("PHASE 16 - trois dossiers sur le bureau")
+
+    modele = resultat["modele"]
+    X = construire_features(df)
+    Xte = X.loc[idx_te]
+    yte = label.loc[idx_te]
+    proba = pd.Series(modele.predict_proba(Xte)[:, 1], index=Xte.index)
+    pred = proba >= 0.5
+
+    confiants = proba[(yte) & (pred)].sort_values(ascending=False)
+    a_la_limite = proba[proba >= 0.5].sort_values()
+    manques = proba[(yte) & (~pred)].sort_values(ascending=False)
+
+    dossiers = [
+        ("forte confiance (vrai canular attrape)", confiants.index[0] if len(confiants) else None),
+        ("juste au-dessus de la frontiere", a_la_limite.index[0] if len(a_la_limite) else None),
+        ("canular laisse passer", manques.index[0] if len(manques) else None),
+    ]
+
+    for nom, idx in dossiers:
+        if idx is None:
+            print(f"\n--- {nom} : aucun cas trouve ---")
+            continue
+        print(f"\n--- dossier : {nom} (index {idx}) ---")
+        print(f"probabilite annoncee : {proba.loc[idx]:.3f}   canular reel : {bool(yte.loc[idx])}")
+        print(f"releve : {df.loc[idx, ['datetime', 'city', 'state', 'shape']].to_dict()}")
+        for nom_col, contrib in expliquer_ligne(modele, X.loc[[idx]]):
+            sens = "pousse vers canular" if contrib > 0 else "pousse vers pas-canular"
+            print(f"   {nom_col:26s} {contrib:+.3f}  ({sens})")
+
+    print("\n--- importance globale (permutation : colonne melangee, recall qui chute) ---")
+    base_recall = recall_score(yte, pred)
+    rng = np.random.RandomState(RANDOM_STATE)
+    chutes = []
+    for col in CAT_COLS + NUM_COLS:
+        Xperm = Xte.copy()
+        Xperm[col] = rng.permutation(Xperm[col].values)
+        pred_perm = modele.predict_proba(Xperm)[:, 1] >= 0.5
+        recall_perm = recall_score(yte, pred_perm)
+        chutes.append((col, base_recall - recall_perm))
+    chutes.sort(key=lambda t: -t[1])
+    for col, chute in chutes:
+        print(f"  {col:22s} chute de recall = {chute:+.3f}")
+
+    return chutes
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 : l'angle mort du Bureau
+# ---------------------------------------------------------------------------
+def phase17_angle_mort(df, label, idx_te, resultat):
+    section("PHASE 17 - l'angle mort du Bureau")
+
+    modele = resultat["modele"]
+    X = construire_features(df)
+    Xte = X.loc[idx_te]
+    yte = label.loc[idx_te]
+    pred = pd.Series(modele.predict_proba(Xte)[:, 1], index=Xte.index) >= 0.5
+
+    part_us = (df["country"] == "us").mean()
+    print(f"part des relevés venant des Etats-Unis : {part_us:.1%}")
+
+    zones = {
+        "us": df["country"] == "us",
+        "manquant": df["country"] == "",
+        "ca": df["country"] == "ca",
+        "gb": df["country"] == "gb",
+    }
+    zones["autres"] = ~(zones["us"] | zones["manquant"] | zones["ca"] | zones["gb"])
+
+    print(f"\n{'zone':>10s} {'n (test)':>9s} {'% canulars':>11s} {'recall':>8s} {'precision':>10s}")
+    print(f"{'GLOBAL':>10s} {len(idx_te):9d} {yte.mean():10.2%} "
+          f"{recall_score(yte, pred):7.2%} {precision_score(yte, pred):9.2%}")
+
+    for nom, masque in zones.items():
+        idx_zone = idx_te.intersection(df.index[masque])
+        if len(idx_zone) == 0:
+            continue
+        y_zone = label.loc[idx_zone]
+        p_zone = pred.loc[idx_zone]
+        rec = recall_score(y_zone, p_zone) if y_zone.sum() > 0 else float("nan")
+        prec = precision_score(y_zone, p_zone) if p_zone.sum() > 0 else float("nan")
+        print(f"{nom:>10s} {len(idx_zone):9d} {y_zone.mean():10.2%} {rec:7.2%} {prec:9.2%}")
+
+    print("\nAttention : gb/ca/autres pesent quelques centaines a quelques milliers de")
+    print("relevés avec parfois une poignee de canulars seulement - meme logique que la")
+    print("phase 15, leurs chiffres individuels ont une marge large.")
+
+    return zones
+
+
+# ---------------------------------------------------------------------------
+# Phase 18 : la transmission d'archive
+# ---------------------------------------------------------------------------
+def phase18_transmission_archive(df, label, idx_tr, idx_te, resultat_p8, resultat_p15):
+    section("PHASE 18 - la transmission d'archive")
+
+    modele_p8 = resultat_p8["modele"]
+
+    df["annee_publication"] = df["date_posted_parsed"].dt.year
+    n_par_annee = df.groupby("annee_publication").size()
+    taux_par_annee = df.groupby("annee_publication").apply(lambda g: label.loc[g.index].mean())
+
+    print("proportion de canulars par annee de PUBLICATION (date_posted, comme phase 8) :")
+    print(f"{'annee':>6s} {'n':>7s} {'% canulars':>11s}")
+    for annee in sorted(taux_par_annee.index):
+        print(f"{int(annee):6d} {int(n_par_annee[annee]):7d} {taux_par_annee[annee]:10.2%}")
+
+    print("\n-> la courbe n'est pas plate : quasi nulle en 1998-2004, une montee nette")
+    print("2005-2011 (pic vers 2008), puis une retombee en 2012-2013. Ce profil ressemble")
+    print("a une periode ou le Bureau a ete plus systematique sur l'annotation 'hoax',")
+    print("avant de relacher - exactement le scenario redoute par le Conseil.")
+
+    cutoff = df["annee_publication"].quantile(0.8)
+    idx_tr_temps = df.index[df["annee_publication"] <= cutoff]
+    idx_te_temps = df.index[df["annee_publication"] > cutoff]
+    X = construire_features(df)
+    resultat_temps = entrainer_sur_indices(X, label, idx_tr_temps, idx_te_temps, avec_texte=False)
+
+    print(f"\nEpreuve - entraine sur les publications <= {int(cutoff)}, teste sur les plus recentes :")
+    print(f"recall    : phase 8 = {resultat_p8['recall']:.2%}   ancien->recent = {resultat_temps['recall']:.2%}")
+    print(f"precision : phase 8 = {resultat_p8['precision']:.2%}   ancien->recent = {resultat_temps['precision']:.2%}")
+
+    # taux d'alerte de reference sur le test actuel (ne demande jamais l'etiquette)
+    X = construire_features(df)
+    proba_te = modele_p8.predict_proba(X.loc[idx_te])[:, 1]
+    pred_te = proba_te >= 0.5
+    taux_alerte_ref = pred_te.mean()
+    proba_moy_ref = proba_te.mean()
+
+    # bootstrap sur ce meme taux d'alerte, meme methode qu'en phase 15 - mais
+    # ici la quantite reechantillonnee (le taux d'alerte) ne regarde jamais l'etiquette
+    rng = np.random.RandomState(RANDOM_STATE)
+    n = len(pred_te)
+    taux_reech = [pred_te[rng.randint(0, n, n)].mean() for _ in range(1000)]
+    lo_taux, hi_taux = np.percentile(taux_reech, [2.5, 97.5])
+
+    print(f"\ntaux d'alerte de reference (partie test, seuil 0.5) : {taux_alerte_ref:.2%}")
+    print(f"intervalle bootstrap 95% de ce taux (meme methode que phase 15) : "
+          f"[{lo_taux:.2%} ; {hi_taux:.2%}]")
+
+    print("\nIndicateurs de surveillance ne demandant jamais l'etiquette reelle :")
+    print("1. taux d'alerte hebdomadaire (proportion de relevés entrants marques")
+    print(f"   canular par le systeme) - reference actuelle : {taux_alerte_ref:.2%}.")
+    print(f"2. probabilite moyenne annoncee par le systeme - reference actuelle : "
+          f"{proba_moy_ref:.3f}. Un glissement signale un changement dans les relevés")
+    print("   entrants ou dans le comportement du modele, sans jamais avoir besoin de")
+    print("   savoir qui a raison.")
+    print("frequence de suivi : hebdomadaire.")
+    print(f"seuil d'alerte : le taux d'alerte hebdomadaire sort de [{lo_taux:.2%} ; {hi_taux:.2%}]")
+    print("(intervalle bootstrap du taux de reference, meme methode qu'en phase 15)")
+    print("deux semaines de suite -> on rappelle les analystes.")
+
+    return resultat_temps
+
+
 def main():
     telecharger_si_besoin()
     df, total, n_chargees, n_de_cote = phase1_ouvrir_la_caisse()
@@ -673,9 +1000,16 @@ def main():
     resultat_p7 = phase7_evenements(df, label, resultat_p5)
     idx_tr, idx_te, resultat_p8 = phase8_ordre_du_temps(df, label, resultat_p7)
     phase9_cases_vides(df, label)
-    phase10_chaine_de_traitement(df, label, idx_tr, idx_te, resultat_p8)
+    resultat_p10 = phase10_chaine_de_traitement(df, label, idx_tr, idx_te, resultat_p8)
     df = phase11_duree(df)
     phase12_ville_et_heure(df, label, idx_tr, idx_te)
+
+    phase13_facture(df, label, idx_te, resultat_p10)
+    phase14_promesse_80(df, label, idx_tr, idx_te, resultat_p10)
+    resultat_p15 = phase15_deux_analystes(df, label, idx_te, resultat_p10)
+    phase16_trois_dossiers(df, label, idx_te, resultat_p10)
+    phase17_angle_mort(df, label, idx_te, resultat_p10)
+    phase18_transmission_archive(df, label, idx_tr, idx_te, resultat_p8, resultat_p15)
 
     section("FIN")
     print("Toutes les phases ont tourne. Voir RAPPORT.md pour la synthese ecrite.")
