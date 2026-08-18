@@ -170,3 +170,137 @@ Notes brutes (chiffres + décisions). Les `[ ]` sont les endroits où tu
 - [ ] la règle appliquée aux villes, en une phrase
 - [ ] pourquoi 23h doit être proche de 0h et pas de 20h — en quoi l'ancien encodage (0 à 23) posait problème
 - [ ] le bilan cumulé (59,1 %) est un peu plus bas que la phase 10 (68,2 %) — qu'est-ce que t'en dis au Conseil ? (indice : toutes les améliorations ne font pas forcément monter le même chiffre, et c'est OK tant que c'est honnête)
+
+---
+
+# Partie 3 — défendre une décision
+
+*(à partir d'ici, le système de référence est celui de la phase 8/10 : state/country/shape/duration/heure/mois/délai, sans `comments`, découpe par événement + chronologique.)*
+
+## Phase 13 — la facture du Bureau
+
+- grille de coûts : canular manqué = 30 crédits, fausse alerte = 2 crédits, sinon 0
+- seuil par défaut (0,5) : **14 296 crédits**
+- seuil au coût minimal : **0,99** → **3 960 crédits**
+- écart : **10 336 crédits économisés**
+- à ce seuil (0,99) : recall 0 %, 0 alerte levée sur 17 421 relevés (132 canulars présents dans le test)
+
+- [ ] la frontière retenue et pourquoi elle coûte le moins cher (chiffré, pas "le score est meilleur")
+- [ ] ce seuil attrape 0 canular sur 132 — est-ce que tu le retiens quand même ? pourquoi/pourquoi pas (indice : relis l'avertissement affiché par le script, il pointe vers la phase 14)
+
+## Phase 14 — une promesse à 80 %
+
+Avant correction, 10 tranches à effectif égal (~1742 relevés chacune) :
+
+| Tranche (probabilité) | n | Annoncé (moyenne) | Observé (taux réel) |
+|---|---|---|---|
+| 0,08–0,33 | 1743 | 0,284 | 0,003 |
+| 0,33–0,37 | 1742 | 0,350 | 0,002 |
+| 0,37–0,41 | 1742 | 0,390 | 0,003 |
+| 0,41–0,44 | 1742 | 0,423 | 0,003 |
+| 0,44–0,47 | 1742 | 0,452 | 0,006 |
+| 0,47–0,49 | 1742 | 0,480 | 0,006 |
+| 0,49–0,52 | 1742 | 0,509 | 0,007 |
+| 0,52–0,56 | 1742 | 0,542 | 0,014 |
+| 0,56–0,61 | 1742 | 0,584 | 0,013 |
+| 0,61–0,99 | 1742 | 0,661 | 0,019 |
+
+- écart moyen annoncé − observé : **+0,460** (le système annonce très largement plus haut que la réalité)
+- après recalibrage (sigmoid/Platt, appris sur le train uniquement) : écart moyen tombe à **+0,002**
+
+- [ ] dans quel sens le système se trompait (une phrase, avec les chiffres ci-dessus)
+- [ ] pourquoi `class_weight="balanced"` explique ce décalage (indice : ça corrige le tri, pas le chiffre)
+
+## Phase 15 — deux analystes, deux chiffres
+
+- taille de la partie test : 17 421
+- canulars réellement présents : **132**
+- nombre de rééchantillonnages (bootstrap) : 1000
+- recall (nombre principal) : **68,2 %**, intervalle 95 % : **[60,0 % ; 75,6 %]**
+
+- [ ] réponse au Conseil sur les deux analystes (0,31 vs 0,34), en une phrase avec un chiffre à l'appui
+- [ ] pourquoi ce dernier nombre (132 canulars) explique à lui seul la largeur de la fourchette
+
+## Phase 16 — trois dossiers sur le bureau
+
+| Dossier | Index | Proba annoncée | Canular réel | Ce qui pousse la décision (top contributions) |
+|---|---|---|---|---|
+| Forte confiance | 42522 | 0,777 | Oui | shape=disk (+0,56), mois (−0,18), state=NY (+0,16) |
+| Juste au-dessus | 56039 | 0,500 | Non | heure (−0,61), country=inconnu (+0,29), mois (−0,28) |
+| Canular manqué | 87264 | 0,496 | Oui | mois (−0,42), heure (−0,37), shape=triangle (+0,13) |
+
+Classement global (importance par permutation, chute de recall quand la colonne est mélangée) :
+
+| Colonne | Chute de recall |
+|---|---|
+| shape | +0,114 |
+| hour | +0,098 |
+| state | +0,038 |
+| country | +0,030 |
+| month | +0,030 |
+| days_to_post | +0,030 |
+| duration_seconds_num | +0,000 |
+
+- [ ] pour chacun des 3 dossiers : explique avec tes mots pourquoi le système a répondu ça (pas juste recopier le tableau du dessus)
+- [ ] la colonne dont la place t'a surpris — `duration_seconds_num` finit dernière avec un impact nul, malgré toute la phase 11 passée dessus. Pourquoi, à ton avis ?
+
+## Phase 17 — l'angle mort du Bureau
+
+- part des relevés venant des États-Unis : **79,3 %**
+
+| Zone | n (test) | % canulars | Recall | Precision |
+|---|---|---|---|---|
+| GLOBAL | 17 421 | 0,76 % | 68,2 % | 1,36 % |
+| us | 14 684 | 0,69 % | 65,7 % | 1,29 % |
+| manquant | 1 888 | 0,90 % | 82,3 % | 1,23 % |
+| ca | 594 | 0,84 % | 20,0 % | 0,84 % |
+| gb | 170 | 2,94 % | 100,0 % | 4,17 % |
+| autres | 85 | 3,53 % | 100,0 % | 5,66 % |
+
+- [ ] ce que tu remarques (ex : le Canada a un recall bien plus faible que le global, malgré ~600 relevés testés)
+- [ ] même frontière partout, ou une par zone ? décision + 3 lignes (indice : gb/ca/autres ont très peu de canulars réels — relis la phase 15 avant de conclure sur eux)
+
+## Phase 18 — la transmission d'archive
+
+Proportion de canulars par année de **publication** (`date_posted`, comme en phase 8) :
+
+| Année | n | % canulars |
+|---|---|---|
+| 1998 | 982 | 0,00 % |
+| 1999 | 5023 | 0,06 % |
+| 2000 | 3367 | 0,03 % |
+| 2001 | 3973 | 0,03 % |
+| 2002 | 4758 | 0,02 % |
+| 2003 | 5379 | 0,04 % |
+| 2004 | 5779 | 0,03 % |
+| 2005 | 5827 | 0,45 % |
+| 2006 | 4891 | 1,21 % |
+| 2007 | 5385 | 1,95 % |
+| 2008 | 5611 | 2,76 % |
+| 2009 | 6462 | 1,61 % |
+| 2010 | 4867 | 1,58 % |
+| 2011 | 6129 | 1,84 % |
+| 2012 | 8756 | 0,51 % |
+| 2013 | 8170 | 0,64 % |
+| 2014 | 3320 | 1,69 % |
+
+- épreuve (entraîné sur publications ≤ 2012, testé sur les plus récentes) :
+  - recall : phase 8 = 68,2 % → ancien→récent = 59,3 %
+  - precision : phase 8 = 1,36 % → ancien→récent = 1,55 %
+- indicateurs de surveillance proposés (sans jamais connaître l'étiquette réelle) :
+  1. taux d'alerte hebdomadaire (proportion de relevés marqués canular par le système) — référence actuelle : **37,93 %**
+  2. probabilité moyenne annoncée par le système — référence actuelle : **0,467**
+  - fréquence : hebdomadaire
+  - seuil d'alerte : le taux d'alerte hebdomadaire sort de **[37,25 % ; 38,65 %]** (intervalle bootstrap du taux de référence, même méthode qu'en phase 15 — mais ici sur un indicateur qui ne regarde jamais l'étiquette) deux semaines de suite → on rappelle les analystes
+
+- [ ] ce que raconte la courbe année par année, avec tes mots (quasi 0 % jusqu'en 2004, montée nette ensuite, pic 2008, retombée 2012-13)
+- [ ] ce que ça veut dire que le modèle testé "ancien → récent" donne un chiffre différent de la phase 8
+- [ ] pourquoi un indicateur qui a besoin de l'étiquette ne servirait à rien ici (une phrase)
+
+---
+
+## Rapport final
+
+- [ ] relire tout le rapport d'une traite, comme le Conseil le fera
+- [ ] vérifier que chaque `[ ]` ci-dessus est rempli avec tes mots, pas recopié
+- [ ] `analyse.py` relancé une dernière fois dans un dossier vide → mêmes chiffres partout
